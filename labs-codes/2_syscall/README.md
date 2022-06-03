@@ -6,54 +6,44 @@
 
 ## trace
 
-#### 第一步，Makefile
+但是这里缺少了关键的需要阅读文件，如果不看就不懂得做这个实验：
 
-根据实验指导书，首先需要将 `$U/_trace` 添加到 Makefile 的 UPROGS 字段中。
+> kernel/kalloc.c
 
-#### 第二步，添加声明
+在这个实验里，我们需要让内核输出每个mask变量指定的系统函数的调用情况，格式为：
 
-然后需要添加一些声明才能进行编译，进而启动 qemu。需要以下几步：
+```text
+<pid>: syscall <syscall_name> -> <return_value>
+```
 
-在生成的 user/usys.S 文件中可以看到，汇编语言 `li a7, SYS_trace` 将指令码放到了 a7 寄存器中。在内核态 `kernel/syscall.c` 的 syscall 函数中，使用 `p->trapframe->a7` 取出寄存器中的指令码，然后调用对应的函数。
-
-1. 可以看到，在 user/trace.c 文件中，使用了 trace 函数，因此需要在 user/user.h 文件中加入函数声明：`int trace(int);`；
-2. 同时，为了生成进入中断的汇编文件，需要在 `user/usys.pl` 添加进入内核态的入口函数的声明：`entry("trace");`，以便使用 `ecall` 中断指令进入内核态；
-3. 同时在 kernel/syscall.h 中添加系统调用的指令码，这样就可以编译成功了。
-
-> 在生成的 user/usys.S 文件中可以看到，汇编语言 `li a7, SYS_trace` 将指令码放到了 a7 寄存器中。在内核态 `kernel/syscall.c` 的 syscall 函数中，使用 `p->trapframe->a7` 取出寄存器中的指令码，然后调用对应的函数。
-
-#### 第三步，实现 sys_trace() 函数
-
-最主要的部分是实现 sys_trace() 函数，在 kernel/sysproc.c 文件中。目的是实现内核态的 trace() 函数。我们的目的是跟踪程序调用了哪些系统调用函数，因此需要在每个 trace 进程中，添加一个 mask 字段，用来识别是否执行了 mask 标记的系统调用。在执行 trace 进程时，如果进程调用了 mask 所包括的系统调用，就打印到标准输出中。
-
-首先在 kernel/proc.h 文件中，为 proc 结构体添加 mask 字段：`int mask;`。
-
-然后在 sys_trace() 函数中，为该字段进行赋值，赋值的 mask 为系统调用传过来的参数，放在了 `a0` 寄存器中。使用 `argint()` 函数可以从对应的寄存器中取出参数并转成 int 类型。
-
-`argint()` 的函数声明在 kernel/defs.h 中，具体实现在 kernel/syscall.c 中。除了取出 int 型的数据函数外，还有取出地址参数的 argaddr 函数，就是将参数以地址的形式取出来，第二个任务需要使用。
+pid是进程序号， syscall*name是函数名称，return*value是该系统调用返回值，并且要求各个进程的输出是独立的，不相互干扰，所以我们要在 `kernel/proc.h` 文件的proc结构体中加入一个新的变量，让每个进程都有一个自己的mask。
 
 ```c
-uint64 sys_trace(void)
-{
+struct proc {
+  struct spinlock lock;
+
+  // p->lock must be held when using these:
+  enum procstate state;        // Process state
+  struct proc *parent;         // Parent process
+  void *chan;                  // If non-zero, sleeping on chan
+  int killed;                  // If non-zero, have been killed
+  int xstate;                  // Exit status to be returned to parent's wait
+  int pid;                     // Process ID
+
+  // these are private to the process, so p->lock need not be held.
+  uint64 kstack;               // Virtual address of kernel stack
+  uint64 sz;                   // Size of process memory (bytes)
+  pagetable_t pagetable;       // User page table
+  struct trapframe *trapframe; // data page for trampoline.S
+  struct context context;      // swtch() here to run process
+  struct file *ofile[NOFILE];  // Open files
+  struct inode *cwd;           // Current directory
+  char name[16];               // Process name (debugging)
   int mask;
-  if(argint(0, &mask) < 0) 
-    return -1;
-  myproc()->mask = mask;
-  return 0;
-}
+};
 ```
 
-#### 第四步，跟踪子进程
-
-需要跟踪所有 trace 进程下的子进程，在 kernel/proc.c 的 `fork()` 代码中，添加子进程的 mask：
-
-```c
-np->mask = p->mask;
-```
-
-#### 第五步，打印信息
-
-所有的系统调用都需要通过 kernel/syscall.c 中的 `syscall()` 函数来执行，因此在这里添加判断：
+主要的实现就是在 `usr/syscall.c` 文件的syscall函数，我们先看看函数原型：
 
 ```c
 void
@@ -62,12 +52,9 @@ syscall(void)
   int num;
   struct proc *p = myproc();
 
-  num = p->trapframe->a7;
+  num = p->trapframe->a7;//读取系统调用号，等下会说这里怎么来的
   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
     p->trapframe->a0 = syscalls[num]();
-    if ((1 << num) & p->mask) {
-      printf("%d: syscall %s -> %d\n", p->pid, syscalls_name[num], p->trapframe->a0);
-    }
   } else {
     printf("%d %s: unknown sys call %d\n",
             p->pid, p->name, num);
@@ -76,10 +63,18 @@ syscall(void)
 }
 ```
 
-由于系统调用的函数名称没办法直接获取，因此创建了一个数组，用于存储系统调用的名称，syscalls_name 代码如下：
+可以看到
 
 ```c
-char* syscalls_name[] = {
+p->trapframe->a0 = syscalls[num]();
+```
+
+这一行就是调用了系统调用命令，并且把返回值保存在了a0寄存器中（RISCV的C规范是把返回值放在a0中)，所以我们只要在调用系统调用时判断是不是mask规定的输出函数，如果是就输出。
+
+这里有几个点，一个是mask是按位判断的，第二个是proc结构体里的name是整个线程的名字，不是函数调用的函数名称，所以我们不能用p->name，而要自己定义一个数组：
+
+```c
+char *sysname[] = {
 [SYS_fork]    "fork",
 [SYS_exit]    "exit",
 [SYS_wait]    "wait",
@@ -87,7 +82,7 @@ char* syscalls_name[] = {
 [SYS_read]    "read",
 [SYS_kill]    "kill",
 [SYS_exec]    "exec",
-[SYS_fstat]   "fstat",
+[SYS_fstat]   "stat",
 [SYS_chdir]   "chdir",
 [SYS_dup]     "dup",
 [SYS_getpid]  "getpid",
@@ -105,9 +100,139 @@ char* syscalls_name[] = {
 };
 ```
 
-此外，还需添加系统调用入口 `extern uint64 sys_trace(void);` 和 `[SYS_trace] sys_trace,`到 kernel/syscall.c 中。
+所以syscall实现也很简单如下，只加了两行：
 
-其中的 `p->trapframe->a0` 存储的是函数调用的返回值。
+```c
+void
+syscall(void)
+{
+  int num;
+  struct proc *p = myproc();
+
+  num = p->trapframe->a7;
+  if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+    p->trapframe->a0 = syscalls[num]();
+    if((1 << num) & p->mask) {
+      printf("%d: syscall %s -> %d\n", p->pid, sysname[num], p->trapframe->a0);
+    }
+  } else {
+    printf("%d %s: unknown sys call %d\n",
+            p->pid, p->name, num);
+    p->trapframe->a0 = -1;
+  }
+}
+```
+
+那我们怎么把mask这个参数传进来呢，这里官方已经给了trace的用户态函数了：
+
+```c
+int
+main(int argc, char *argv[])
+{
+  int i;
+  char *nargv[MAXARG];
+
+  if(argc < 3 || (argv[1][0] < '0' || argv[1][0] > '9')){
+    fprintf(2, "Usage: %s mask command\n", argv[0]);
+    exit(1);
+  }
+
+  if (trace(atoi(argv[1])) < 0) {
+    fprintf(2, "%s: trace failed\n", argv[0]);
+    exit(1);
+  }
+  
+  for(i = 2; i < argc && i < MAXARG; i++){
+    nargv[i-2] = argv[i];
+  }
+  exec(nargv[0], nargv);
+  exit(0);
+}
+```
+
+可以看到 trace 函数传入的是一个数字，那我们只要在系统调用trace里把这个数字给到现在的线程就好了，不过得首先把trace这个系统调用加入到内核中声明，首先是 `/usre/user.h`文件加入，这里声明了用户态可以调用的系统调用
+
+```c
+int trace(int);
+```
+
+`/user/usys.pl` 文件加入
+
+```text
+entry("trace");
+```
+
+这里perl语言自动生成汇编语言usys.S，是用户态系统调用接口，可以看到首先把系统调用号压入a7寄存器，然后就直接ecall进入系统内核。而我们刚才syscall那个函数就把a7寄存器的数字读出来调用对应的函数，所以这里就是系统调用用户态和内核态的切换接口。
+
+```text
+#usys.S
+.global trace
+trace:
+ li a7, SYS_trace
+ ecall
+ ret
+```
+
+接下来还要给内核态的系统调用trace加上声明和定义，在kernel/syscall.c加上：
+
+```c
+extern uint64 sys_sysinfo(void);
+```
+
+在下面的函数指针数组*syscalls[]加上：
+
+```text
+[SYS_trace]   sys_trace,
+```
+
+加上这两个后，syscall函数才能正确解析我们写的系统调用，然后在kerlnel/sysproc.c加上sys_trace的定义实现，只要把传进来的参数给到现有进程的mask就好了：
+
+```c
+uint64
+sys_trace(void)
+{
+  int mask;
+  if(argint(0, &mask) < 0)
+    return -1;
+  
+  myproc()->mask = mask;
+  return 0;
+}
+```
+
+这里argint这个函数调用了argraw函数，这个函数会去读寄存器a0到a5，所以应该是RISCV习惯是把C语言函数调用参数压入这几个寄存器吧，所以这里的a0就对应我们的mask（这个还不清楚，只是看代码是这样：
+
+```c
+static uint64
+argraw(int n)
+{
+  struct proc *p = myproc();
+  switch (n) {
+  case 0:
+    return p->trapframe->a0;
+  case 1:
+    return p->trapframe->a1;
+  case 2:
+    return p->trapframe->a2;
+  case 3:
+    return p->trapframe->a3;
+  case 4:
+    return p->trapframe->a4;
+  case 5:
+    return p->trapframe->a5;
+  }
+  panic("argraw");
+  return -1;
+}
+```
+
+最后记得把Makefile加上：
+
+```text
+$U/_trace\
+```
+
+就可以运行了。
 
 ## sysinfo
 
